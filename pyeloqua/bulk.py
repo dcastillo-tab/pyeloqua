@@ -6,6 +6,10 @@ from copy import deepcopy
 from json import dumps, dump, load
 import logging
 import requests
+import threading
+import math
+from concurrent.futures import ThreadPoolExecutor
+import csv
 
 from .pyeloqua import Eloqua
 from .system_fields import ACTIVITY_FIELDS, CONTACT_SYSTEM_FIELDS, ACCOUNT_SYSTEM_FIELDS
@@ -49,9 +53,7 @@ class Bulk(Eloqua):
     def __init__(self, username=None, password=None, company=None, test=False):
         """
         Initialize bulk class:
-
         Arguments:
-
         :param string username: Eloqua username
         :param string password: Eloqua password
         :param string company: Eloqua company instance
@@ -72,9 +74,7 @@ class Bulk(Eloqua):
     def _setup_(self, job_type, elq_object, obj_id=None, act_type=None):
         """
         setup a job
-
         Arguments:
-
         :param string job_type: 'imports' or 'exports'
         :param string elq_object: target Eloqua object
         :param int obj_id: parent ID for events or customobjects
@@ -100,9 +100,7 @@ class Bulk(Eloqua):
     def imports(self, elq_object, obj_id=None, act_type=None):
         """
         setup a job with job_type == 'imports'
-
         Arguments:
-
         :param string elq_object: target Eloqua object
         :param int obj_id: parent ID for events or customobjects
         :param string act_type: Activity type
@@ -113,9 +111,7 @@ class Bulk(Eloqua):
     def exports(self, elq_object, obj_id=None, act_type=None):
         """
         setup a job with job_type == 'exports'
-
         Arguments:
-
         :param string elq_object: target Eloqua object
         :param int obj_id: parent ID for events or customobjects
         :param string act_type: Activity type
@@ -126,7 +122,6 @@ class Bulk(Eloqua):
     def write_job(self, path):
         """
         Write Bulk.job to a JSON file for later use
-
         :param str path: export path for job file
         """
 
@@ -136,7 +131,6 @@ class Bulk(Eloqua):
     def read_job(self, path):
         """
         Read a previously exported Bulk.job from a JSON file
-
         :param str path: import path for job file
         """
 
@@ -152,9 +146,7 @@ class Bulk(Eloqua):
         """
         retrieve all fields for specified Eloqua object in job setup;
         useful if unsure what fields are available
-
         Arguments:
-
         :param string elq_object: target Eloqua object
         :param int obj_id: parent ID for events or customobjects
         :param string act_type: Activity type
@@ -205,9 +197,7 @@ class Bulk(Eloqua):
     def add_fields(self, field_input=None):
         """
         retrieve all specified fields and add to job setup
-
         Arguments:
-
         :param list field_input: fields to add by DB name or Display Name
         """
 
@@ -224,7 +214,6 @@ class Bulk(Eloqua):
     def add_linked_fields(self, lnk_obj, field_input):
         """
         add fields from linked objects
-
         :param string lnk_obj: linked object
         :param list field_input: fields to add by name
         """
@@ -250,7 +239,6 @@ class Bulk(Eloqua):
     def add_leadscore_fields(self, model_id=None, name=None):
         """
         add fields from a lead score model
-
         :param string name: name of lead score model
         :param int model_id: id of lead score model
         """
@@ -276,7 +264,6 @@ class Bulk(Eloqua):
     def asset_exists(self, asset, asset_id=None, name=None):
         """
         add filter statement for asset
-
         :param string asset: Eloqua asset type: lists, segments, filters
         :param int asset_id: id of asset
         :param string name: name of asset
@@ -316,7 +303,6 @@ class Bulk(Eloqua):
     def filter_date(self, field, start=None, end=None):
         """
         add a filter by start or end date
-
         :param string field: Field name on which to filter
         :param string start: Datetime string for date >=
         :param string end: Datetime string for date <=
@@ -372,7 +358,6 @@ class Bulk(Eloqua):
     def filter_equal(self, field, value):
         """
         add filter statement for field equals value
-
         :param string field: Field name on which to filter
         :param string value: Field value
         """
@@ -401,7 +386,6 @@ class Bulk(Eloqua):
         """
         add sync actions
         No client-side validation
-
         :param str action: action to perform
         :param str destination: target,
         :param str status: set to status
@@ -423,7 +407,6 @@ class Bulk(Eloqua):
     def add_syncaction_list(self, action, list_id=None, list_name=None):
         """
         add sync action based on shared list ID/Name
-
         :param int list_id: shared list ID
         :param str list_name: shared list name
         """
@@ -447,7 +430,6 @@ class Bulk(Eloqua):
     def create_def(self, name):
         """
         create an import definition based on current object attributes
-
         :param str name: name of import/export definition
         """
 
@@ -553,7 +535,6 @@ class Bulk(Eloqua):
     def handle_sync(self, **kwargs):
         """
         sync and handle errors; raise errors or log warnings
-
         :param **kwargs: keyword arguments for `Bulk.sync()`
         """
         status = self.sync(**kwargs)
@@ -583,63 +564,130 @@ class Bulk(Eloqua):
             data, ensure_ascii=False).encode('utf8'), headers=POST_HEADERS)
 
         _elq_error_(req)
-
-    def get_data(self, endpoint, max_recs=None, offset=0):
+        
+    def get_api_data(self, url, file, lock, header=False):
+        req = requests.get(url=url, auth=self.auth)
+        _elq_error_(req)
+        print(url)
+        
+        if 'items' in req.json().keys():
+            data = req.json()['items']
+            data_len = len(data)
+            
+            if header:
+                with lock:
+                    with open(file, 'w', encoding='utf8', newline='') as f:
+                        fc = csv.DictWriter(f, fieldnames=data[0].keys())
+                        fc.writeheader()
+                        fc.writerows(data)
+            else:    
+                with lock:
+                    with open(file, 'a', encoding='utf8', newline='') as f:
+                        fc = csv.DictWriter(f, fieldnames=data[0].keys())
+                        fc.writerows(data)
+        if header:
+            return data_len, req.json()['hasMore'], req.json()['totalResults']
+        else:
+            return data_len, req.json()['hasMore']
+        
+    def get_data_threads(self, endpoint, file, lock, offset=1000, num_threads=5):
         """
         get data from a given endpoint
         this simplifies the looping process that would otherwise be repeated
+        :param str endpoint: endpoint to be appended to bulk_base
+        :param int max_recs: Max number of records to return
+        """
+        
+        offset_inc = 0
+        url_base = self.bulk_base + endpoint + '?limit={limit}&offset={offset}'
+        url = url_base.format(limit=offset, offset=0)
+        _, _, total = self.get_api_data(url, file, lock, header=True)
+        
+        with ThreadPoolExecutor(max_workers=num_threads) as executor:
+            urls = []
+            offset_inc=offset
+            for i in range(math.ceil(total/offset)-1):
+                url_base = self.bulk_base + endpoint + '?limit={limit}&offset={offset}'
+                url = url_base.format(limit=offset, offset=offset_inc)
+                urls.append(url)
+                offset_inc += offset
+            
+            future = [executor.submit(self.get_api_data, url, file, lock) for url in urls]
 
+
+    def get_data(self, endpoint, file, max_recs=None, offset=1000):
+        """
+        get data from a given endpoint
+        this simplifies the looping process that would otherwise be repeated
         :param str endpoint: endpoint to be appended to bulk_base
         :param int max_recs: Max number of records to return
         """
 
         url_base = self.bulk_base + endpoint + '?limit={limit}&offset={offset}'
 
-        limit, has_more = self._set_limit(max_recs, 0, True)
+        limit, has_more = self._set_limit(max_recs, 0, True, offset)
 
         return_data = []
 
+        i = 0
+        data_len = 0
+        offset_inc = 0
         while has_more:
-
-            url = url_base.format(limit=limit, offset=offset)
+          
+            url = url_base.format(limit=limit, offset=offset_inc)
+            print(url)
 
             req = requests.get(url=url, auth=self.auth)
 
             _elq_error_(req)
 
             if 'items' in req.json().keys():
-                return_data.extend(req.json()['items'])
+                data = req.json()['items']
+                data_len += len(data)
+#                 return_data.extend(data)
+                
+                if i == 0:
+                    with open(file, 'w', encoding='utf8', newline='') as f:
+                        fc = csv.DictWriter(f, fieldnames=data[0].keys())
+                        fc.writeheader()
+                        fc.writerows(data)
+                else:
+                    with open(file, 'a', encoding='utf8', newline='') as f:
+                        fc = csv.DictWriter(f, fieldnames=data[0].keys())
+                        fc.writerows(data)
+                    
 
-            offset += 1000
+            offset_inc += offset
 
             if max_recs is None:
 
                 has_more = req.json()['hasMore']
 
-            limit, has_more = self._set_limit(max_recs, len(return_data),
-                                              req.json()['hasMore'])
+            limit, has_more = self._set_limit(max_recs, data_len,
+                                              req.json()['hasMore'], offset)
+            i += 1
 
-        return return_data
+#         return return_data
 
 
-    def _set_limit(self, max_recs, row_ct, has_more):
+    def _set_limit(self, max_recs, row_ct, has_more, offset):
         """  """
 
         # default limit return 1000
         # Used when pulling all data
         if max_recs is None:
-            return 1000, has_more
+            return offset, has_more
 
-        if (max_recs - row_ct) >= 1000:
-            return 1000, True
+        if (max_recs - row_ct) >= offset:
+            #handle this case
+            return offset, True
 
         return (max_recs - row_ct), False
 
 
-    def get_export_data(self, max_recs=None, offset=0):
+    def get_export_data(self, file, max_recs=None, offset=1000, threads=False, num_threads=5):
         """
         retrieve all synced data for an export
-
         :param int limit: Max number of records to return from export
         """
 
@@ -647,16 +695,19 @@ class Bulk(Eloqua):
             raise Exception('not an export')
 
         endpoint = self.job_def['uri'] + '/data'
+        
+        if threads:
+            lock = threading.RLock()
+            self.get_data_threads(endpoint=endpoint, file=file, lock=lock, offset=offset, num_threads=num_threads)
+        else:
+            self.get_data(endpoint=endpoint, file=file, max_recs=max_recs, offset=offset)
 
-        return_data = self.get_data(endpoint=endpoint, max_recs=max_recs, offset=offset)
-
-        return return_data
+#         return return_data
 
 
     def get_export_count(self):
         """
         retrieve count of synced data records
-
         :return int:
         """
 
